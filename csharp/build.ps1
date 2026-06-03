@@ -1,6 +1,7 @@
-# Builds the C# POC two ways for comparison:
+# Builds the C# POC three ways for comparison:
 #   1) Framework-dependent (needs .NET 10 runtime) -> out\fdd
 #   2) Native AOT, self-contained, single file     -> out\aot
+#   3) Native AOT + LZMA compression (PeekDesktop)  -> out\aot-lzma
 # Reports the resulting executable sizes.
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +10,7 @@ $proj = Join-Path $here 'AltWindowCycle.csproj'
 
 $fdd = Join-Path $here 'out\fdd'
 $aot = Join-Path $here 'out\aot'
+$lzma = Join-Path $here 'out\aot-lzma'
 
 Write-Host '== Framework-dependent publish ==' -ForegroundColor Cyan
 dotnet publish $proj -c Release -r win-x64 --self-contained false `
@@ -16,6 +18,9 @@ dotnet publish $proj -c Release -r win-x64 --self-contained false `
 
 Write-Host '== Native AOT publish ==' -ForegroundColor Cyan
 dotnet publish $proj -c Release -r win-x64 -o $aot | Out-Null
+
+Write-Host '== Native AOT + LZMA publish ==' -ForegroundColor Cyan
+dotnet publish $proj -c Release -r win-x64 -p:AotCompress=true -o $lzma | Out-Null
 
 function Show-Size($label, $path) {
     if (Test-Path $path) {
@@ -26,5 +31,6 @@ function Show-Size($label, $path) {
     }
 }
 
-Show-Size 'FDD exe ' (Join-Path $fdd 'AltWindowCycle.exe')
-Show-Size 'AOT exe ' (Join-Path $aot 'AltWindowCycle.exe')
+Show-Size 'FDD exe     ' (Join-Path $fdd 'AltWindowCycle.exe')
+Show-Size 'AOT exe     ' (Join-Path $aot 'AltWindowCycle.exe')
+Show-Size 'AOT+LZMA exe' (Join-Path $lzma 'AltWindowCycle.exe')

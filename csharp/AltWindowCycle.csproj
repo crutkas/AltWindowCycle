@@ -20,4 +20,11 @@
     <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- LZMA self-extracting compression for AOT single-file (à la PeekDesktop).
+         Opt-in: publish with -p:AotCompress=true. Decompresses at startup. -->
+    <PackageReference Include="PublishAotCompressed" Version="1.0.5" PrivateAssets="all"
+                      Condition="'$(AotCompress)' == 'true'" />
+  </ItemGroup>
+
 </Project>

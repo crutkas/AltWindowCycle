@@ -56,9 +56,14 @@ Static CRT (`/MT`), size-optimized (`/O1 /Os /GL /LTCG /OPT:REF,ICF`),
 
 ```powershell
 .\csharp\build.ps1
-# -> csharp\out\fdd\AltWindowCycle.exe  (framework-dependent, needs .NET 10)
-# -> csharp\out\aot\AltWindowCycle.exe  (Native AOT, self-contained)
+# -> csharp\out\fdd\AltWindowCycle.exe       (framework-dependent, needs .NET 10)
+# -> csharp\out\aot\AltWindowCycle.exe       (Native AOT, self-contained)
+# -> csharp\out\aot-lzma\AltWindowCycle.exe  (Native AOT + LZMA compression)
 ```
+
+LZMA compression is opt-in via `-p:AotCompress=true` (uses
+[PublishAotCompressed](https://github.com/MichalStrehovsky/PublishAotCompressed)),
+the same self-extracting trick PeekDesktop uses for its smallest builds.
 
 ## POC comparison
 
@@ -69,16 +74,25 @@ Measured on Windows 11 (x64), VS 2026 / .NET 10:
 | C++ (`/MT`) | ~118 KB | ✅ | Smallest, zero deps, instant start |
 | C# framework-dependent | ~158 KB | ❌ | Needs .NET 10 runtime installed |
 | C# Native AOT | ~1.05 MB | ✅ | Self-contained, no runtime needed |
+| C# Native AOT + LZMA | ~471 KB | ✅ | Self-extracting; ~1 MB working set |
 
 Takeaways:
 
-- **C++** wins on size and footprint for a standalone tray-less utility.
-- **C# AOT** is dramatically larger as a standalone exe but is far more
-  maintainable and matches how most PowerToys modules are authored
-  (the runtime is shared once PowerToys is installed, so the marginal cost is
-  much smaller than the standalone 1 MB suggests).
-- The core logic is identical and tiny in both; the decision for PowerToys is
-  mostly about matching the existing module conventions.
+- **C++** wins on size and footprint for a standalone tray-less utility — native
+  code has no runtime floor at all (~1 MB idle working set).
+- **C# Native AOT** sits on the ~1 MB AOT runtime floor (GC, type system,
+  exception handling). Our app is so small it's basically *at* that floor, so the
+  size knobs (`OptimizationPreference=Size`, `InvariantGlobalization`,
+  `StackTraceSupport=false`, `UseSystemResourceKeys`) buy little here.
+- **LZMA compression** (the trick behind PeekDesktop's headline "tiny" number)
+  is a post-build self-extracting wrapper, *not* an AOT compiler setting. It
+  roughly halves the on-disk size (~471 KB) at the cost of a small decompress on
+  startup. PeekDesktop's own uncompressed AOT was ~1.88 MB — larger than ours —
+  because it does much more (tray icon, JSON settings, update check).
+- The core logic is identical and tiny in both languages; the PowerToys decision
+  is mostly about matching existing module conventions (the .NET runtime is
+  shared once PowerToys is installed, so AOT's standalone 1 MB is not a real cost
+  there).
 
 ## Running
 
