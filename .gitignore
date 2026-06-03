@@ -1,0 +1,15 @@
+# Build output
+out/
+bin/
+obj/
+
+# VS / tooling
+.vs/
+*.user
+
+# Native intermediates
+*.obj
+*.ilk
+*.pdb
+*.exp
+*.lib
