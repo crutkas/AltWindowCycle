@@ -51,7 +51,10 @@ How it's built (all raw Win32, so it ports straight into the C++ PowerToys modul
   list once on the first press and only materializes the overlay if you keep
   <kbd>Alt</kbd> held — quick taps stay flash-free.
 - A non-layered `WS_POPUP` (`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`,
-  shown with `SW_SHOWNA`) carries the dark acrylic backdrop without stealing focus.
+  shown with `SW_SHOWNA`) carries an Alt-Tab-style "In-App Acrylic - Thin" backdrop
+  without stealing focus. The POC uses the shell recipe values where Win32 exposes
+  them: dark tint color `#545454`, zero tint opacity, 1px surface stroke, and 8px
+  panel radius.
 - Preview snapshots are drawn into the same per-pixel-alpha layered surface as the
   chrome, so rounded thumbnail corners are a real alpha mask over the acrylic
   background instead of opaque cover pixels. Each tile is a Win11-style card: a

@@ -89,7 +89,15 @@ typedef BOOL(WINAPI* PFN_SetWindowCompositionAttribute)(HWND, WINDOWCOMPOSITIONA
 
 namespace AltTabStyle
 {
-    constexpr DWORD DefaultAcrylicGradientABGR = 0x68787880;
+    // Alt-Tab uses In-App Acrylic Thin:
+    // TintColor=#545454, TintOpacity=0, TintLuminosityOpacity=0.64,
+    // FallbackColor=#202020, CornerRadius=8, BorderThickness=1.
+    // ACCENT_POLICY exposes only a single AABBGGRR gradient value, so the Win32
+    // fallback encodes the zero tint opacity + tint color and keeps the luminosity
+    // token documented here for the eventual WinUI/Composition port.
+    constexpr DWORD AcrylicThinGradientABGR = 0x00545454;
+    constexpr double AcrylicThinTintLuminosityOpacity = 0.64;
+    constexpr COLORREF AcrylicThinFallbackRef = RGB(32, 32, 32);
 
     inline COLORREF DebugMagentaRef() { return RGB(255, 0, 255); }
     inline COLORREF AccentFallbackRef() { return RGB(0, 120, 215); }
@@ -121,6 +129,7 @@ namespace AltTabStyle
     {
         return Gdiplus::Color(255, GetRValue(accent), GetGValue(accent), GetBValue(accent));
     }
+    inline Gdiplus::Color SurfaceStrokeDefault() { return Gdiplus::Color(64, 255, 255, 255); }
     inline Gdiplus::Color FocusShadow() { return Gdiplus::Color(150, 0, 0, 0); }
 }
 
@@ -135,7 +144,7 @@ static DWORD GetAcrylicGradientABGR()
         if (end && *end == L'\0')
             return parsed;
     }
-    return AltTabStyle::DefaultAcrylicGradientABGR;
+    return AltTabStyle::AcrylicThinGradientABGR;
 }
 
 // Give `hwnd` a dark acrylic backdrop (blurred desktop + dark tint), like Alt-Tab.
@@ -688,7 +697,7 @@ void Switcher::ShowOverlayWindow()
         else
         {
             rgn = CreateRoundRectRgn(0, 0, panelW + 1, panelH + 1,
-                                     2 * Scaled(12), 2 * Scaled(12));
+                                     2 * Scaled(8), 2 * Scaled(8));
         }
         SetWindowRgn(thumbHost, rgn, FALSE); // window owns rgn now
         RedrawWindow(thumbHost, nullptr, nullptr,
@@ -1315,7 +1324,7 @@ void Switcher::RenderBackdrop()
         Gdiplus::GraphicsPath panel;
         RECT panelRect = { 0, 0, w, h };
         BuildRoundRect(panel, InflateF(panelRect, 0),
-                       static_cast<Gdiplus::REAL>(Scaled(12)));
+                       static_cast<Gdiplus::REAL>(Scaled(8)));
         Gdiplus::SolidBrush brush(AltTabStyle::TranslucentBackdrop());
         g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
         g.FillPath(&brush, &panel);
@@ -1383,7 +1392,7 @@ void Switcher::RenderLayered()
 
         // Leave the overlay panel transparent. Acrylic lives on thumbHost in normal
         // mode; the simple translucent diagnostic backdrop lives on backdropHost.
-        Gdiplus::REAL panelRadius = static_cast<Gdiplus::REAL>(Scaled(12));
+        Gdiplus::REAL panelRadius = static_cast<Gdiplus::REAL>(Scaled(8));
         RECT panelRect = { 0, 0, w, h };
         Gdiplus::GraphicsPath panel;
         BuildRoundRect(panel, InflateF(panelRect, 0), panelRadius);
@@ -1391,6 +1400,9 @@ void Switcher::RenderLayered()
         g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
         g.FillPath(&panelBrush, &panel);
         g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
+        Gdiplus::Pen panelStroke(AltTabStyle::SurfaceStrokeDefault(),
+                                 static_cast<Gdiplus::REAL>((std::max)(1, Scaled(1))));
+        g.DrawPath(&panelStroke, &panel);
 
         COLORREF accent = GetAccentColor();
         Gdiplus::Color accentClr = AltTabStyle::Accent(accent);
