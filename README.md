@@ -33,6 +33,38 @@ Both POCs share the same algorithm:
 groups multi-window apps (and multi-process apps like browsers, whose top-level
 windows belong to the main process).
 
+## Alt-Tab-style overlay (C++ POC)
+
+The C++ POC has an optional on-screen picker that shows window previews of the
+candidate windows while you cycle — the same hold-to-preview feel as Alt+Tab:
+
+1. **Tap** <kbd>Alt</kbd>+<kbd>`</kbd> and release quickly → instant switch, the
+   overlay never appears (preserves the snappy default behavior).
+2. **Hold** <kbd>Alt</kbd> and keep tapping <kbd>`</kbd> → after a short delay
+   (~180 ms) the overlay appears; each tap advances the highlighted selection.
+   <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>`</kbd> moves backward.
+3. **Release** <kbd>Alt</kbd> to activate the highlighted window; **Esc** cancels.
+
+How it's built (all raw Win32, so it ports straight into the C++ PowerToys module):
+
+- A delayed-show state machine (`Idle → Pending → Visible`) captures the candidate
+  list once on the first press and only materializes the overlay if you keep
+  <kbd>Alt</kbd> held — quick taps stay flash-free.
+- A non-layered `WS_POPUP` (`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`,
+  shown with `SW_SHOWNA`) carries the dark acrylic backdrop without stealing focus.
+- Preview snapshots are drawn into the same per-pixel-alpha layered surface as the
+  chrome, so rounded thumbnail corners are a real alpha mask over the acrylic
+  background instead of opaque cover pixels. Each tile is a Win11-style card: a
+  header "tab" on top with the **app icon + window title**, the preview below, and
+  an accent outline on the selected tile. Per-monitor DPI aware, centered on the
+  focused window's monitor work area.
+
+The overlay is **on by default**; pass `--no-overlay` for the original
+instant-switch behavior. In PowerToys this maps to a togglable setting.
+
+`--selftest` force-shows the overlay for the app with the most open windows for a
+few seconds (used to validate rendering headlessly).
+
 ## Layout
 
 ```
@@ -71,7 +103,7 @@ Measured on Windows 11 (x64), VS 2026 / .NET 10:
 
 | Build | Size | Self-contained | Notes |
 | --- | ---: | --- | --- |
-| C++ (`/MT`) | ~118 KB | ✅ | Smallest, zero deps, instant start |
+| C++ (`/MT`) | ~128 KB | ✅ | Smallest, zero deps, instant start (incl. overlay) |
 | C# framework-dependent | ~158 KB | ❌ | Needs .NET 10 runtime installed |
 | C# Native AOT | ~1.05 MB | ✅ | Self-contained, no runtime needed |
 | C# Native AOT + LZMA | ~471 KB | ✅ | Self-extracting; ~1 MB working set |
@@ -97,12 +129,17 @@ Takeaways:
 ## Running
 
 Run either `AltWindowCycle.exe`. It registers the two global hotkeys and sits in
-the background (no window, no tray icon — this is a POC). It is single-instance.
-To stop it, end the `AltWindowCycle` process.
+the background (no tray icon — this is a POC). It is single-instance. To stop it,
+end the `AltWindowCycle` process.
+
+The C++ build shows the Alt-Tab-style overlay by default (see above); run it with
+`--no-overlay` for instant switching, or `--selftest` to preview the overlay.
 
 ## Status
 
 - [x] Phase 1: C++ and C# POCs with shared algorithm, built and validated
+- [x] Alt-Tab-style acrylic preview overlay (C++ POC, togglable via `--no-overlay`)
+- [ ] Port the overlay into the PowerToys C++ module as a togglable setting
 - [ ] Phase 2: PowerToys module integration (settings UI, configurable hotkey,
       enable/disable, telemetry, MRU ordering option)
 
@@ -111,4 +148,7 @@ To stop it, end the `AltWindowCycle` process.
 - MRU (most-recently-used) ordering instead of stable `HWND` order, matching
   macOS more closely (requires tracking activation order via a WinEvent hook).
 - Configurable hotkey and "same app" definition (process path vs. AppUserModelID).
-- Optional on-screen window picker overlay (à la Alt+Tab) while the key is held.
+- Port the acrylic preview overlay (currently C++ only) to the C# POC, or straight
+  into the PowerToys C++ module behind a `show_overlay` setting.
+- Low-level keyboard hook for Alt-release detection (the POC polls
+  `GetAsyncKeyState` on a timer, which is fine but slightly less precise).
