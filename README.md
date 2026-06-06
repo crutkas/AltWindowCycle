@@ -47,20 +47,18 @@ candidate windows while you cycle — the same hold-to-preview feel as Alt+Tab:
 
 How it's built (all raw Win32, so it ports straight into the C++ PowerToys module):
 
-- A delayed-show state machine (`Idle → Pending → Visible`) captures the candidate
-  list once on the first press and only materializes the overlay if you keep
-  <kbd>Alt</kbd> held — quick taps stay flash-free.
+- The first hotkey press captures the candidate list and immediately materializes
+  the overlay, so the picker appears without an intentional reveal delay.
 - A non-layered `WS_POPUP` (`WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`,
   shown with `SW_SHOWNA`) carries an Alt-Tab-style "In-App Acrylic - Thin" backdrop
   without stealing focus. The POC uses the shell recipe values where Win32 exposes
   them: dark tint color `#545454`, zero tint opacity, 1px surface stroke, and 8px
   panel radius.
-- Preview snapshots are drawn into the same per-pixel-alpha layered surface as the
-  chrome, so rounded thumbnail corners are a real alpha mask over the acrylic
-  background instead of opaque cover pixels. Each tile is a Win11-style card: a
-  header "tab" on top with the **app icon + window title**, the preview below, and
-  an accent outline on the selected tile. Per-monitor DPI aware, centered on the
-  focused window's monitor work area.
+- DWM live thumbnails provide compositor-fidelity previews behind the layered
+  chrome. Each tile is a Win11-style card: a header "tab" on top with the
+  **app icon + window title**, the preview below, and an accent outline on the
+  selected tile. Per-monitor DPI aware, centered on the focused window's monitor
+  work area.
 
 The overlay is **on by default**; pass `--no-overlay` for the original
 instant-switch behavior. In PowerToys this maps to a togglable setting.
