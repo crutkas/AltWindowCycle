@@ -4,10 +4,9 @@
 //   Shift+Alt+`  -> previous window
 //
 // Two interaction modes (toggle with --no-overlay):
-//   * Overlay (default): tap-and-hold Alt to bring up an Alt-Tab-style picker with
-//     acrylic-backed masked preview snapshots; each tap of ` advances the selection;
-//     release Alt to commit, Esc to cancel. A quick tap+release never shows the
-//     overlay (instant).
+//   * Overlay (default): Alt+` immediately brings up an Alt-Tab-style picker with
+//     acrylic-backed DWM live thumbnails; each tap of ` advances the selection;
+//     release Alt to commit, Esc to cancel.
 //   * Instant (--no-overlay): the original behavior, switches immediately.
 //
 // Tiny, dependency-free Win32 (Win32 + DWM/GDI/GDI+). No CRT UI deps.
@@ -117,6 +116,10 @@ namespace AltTabStyle
         return selected ? Gdiplus::Color(255, 58, 58, 62)
                         : Gdiplus::Color(255, 43, 43, 46);
     }
+    inline COLORREF CardRef(bool selected)
+    {
+        return selected ? RGB(58, 58, 62) : RGB(43, 43, 46);
+    }
     inline Gdiplus::Color PreviewMask(bool selected, bool magentaDebug, bool translucentBackdrop)
     {
         if (translucentBackdrop)
@@ -130,6 +133,11 @@ namespace AltTabStyle
         return Gdiplus::Color(255, GetRValue(accent), GetGValue(accent), GetBValue(accent));
     }
     inline Gdiplus::Color SurfaceStrokeDefault() { return Gdiplus::Color(64, 255, 255, 255); }
+    inline Gdiplus::Color PreviewStroke(bool selected)
+    {
+        return selected ? Gdiplus::Color(90, 255, 255, 255)
+                        : Gdiplus::Color(45, 255, 255, 255);
+    }
     inline Gdiplus::Color FocusShadow() { return Gdiplus::Color(150, 0, 0, 0); }
 }
 
@@ -204,6 +212,64 @@ static std::wstring ProcessImagePath(HWND hwnd)
     return result;
 }
 
+// True for paths whose filename is ApplicationFrameHost.exe (the shared host that
+// owns every UWP/packaged app's top-level ApplicationFrameWindow).
+static bool IsApplicationFrameHost(const std::wstring& path)
+{
+    size_t slash = path.find_last_of(L"\\/");
+    const wchar_t* name = path.c_str() + (slash == std::wstring::npos ? 0 : slash + 1);
+    return _wcsicmp(name, L"ApplicationFrameHost.exe") == 0;
+}
+
+struct CoreWindowFind
+{
+    DWORD hostPid = 0;
+    HWND found = nullptr;
+};
+
+static BOOL CALLBACK FindCoreWindowProc(HWND child, LPARAM lp)
+{
+    CoreWindowFind* cf = reinterpret_cast<CoreWindowFind*>(lp);
+    wchar_t cls[64];
+    if (GetClassNameW(child, cls, ARRAYSIZE(cls)) &&
+        wcscmp(cls, L"Windows.UI.Core.CoreWindow") == 0)
+    {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(child, &pid);
+        if (pid && pid != cf->hostPid)
+        {
+            cf->found = child;
+            return FALSE; // stop enumerating
+        }
+    }
+    return TRUE;
+}
+
+// Image path that identifies the *real* owning app. For UWP/packaged windows the
+// top-level window belongs to ApplicationFrameHost.exe, so all packaged apps would
+// otherwise group together. Resolve to the hosted CoreWindow's actual process so
+// each packaged app is grouped on its own.
+static std::wstring RealProcessImagePath(HWND hwnd)
+{
+    std::wstring path = ProcessImagePath(hwnd);
+    if (!IsApplicationFrameHost(path))
+        return path;
+
+    DWORD hostPid = 0;
+    GetWindowThreadProcessId(hwnd, &hostPid);
+
+    CoreWindowFind cf;
+    cf.hostPid = hostPid;
+    EnumChildWindows(hwnd, FindCoreWindowProc, reinterpret_cast<LPARAM>(&cf));
+    if (cf.found)
+    {
+        std::wstring real = ProcessImagePath(cf.found);
+        if (!real.empty())
+            return real;
+    }
+    return path;
+}
+
 // Standard "does this window appear in Alt+Tab" test.
 static bool IsAltTabWindow(HWND hwnd)
 {
@@ -248,7 +314,7 @@ static BOOL CALLBACK EnumProc(HWND hwnd, LPARAM lp)
     EnumCtx* ctx = reinterpret_cast<EnumCtx*>(lp);
     if (!IsAltTabWindow(hwnd))
         return TRUE;
-    std::wstring exe = ProcessImagePath(hwnd);
+    std::wstring exe = RealProcessImagePath(hwnd);
     if (!exe.empty() && _wcsicmp(exe.c_str(), ctx->exe.c_str()) == 0)
         ctx->windows.push_back(hwnd);
     return TRUE;
@@ -264,7 +330,7 @@ static bool GetAppWindows(HWND& foreground, std::vector<HWND>& windows)
         return false;
 
     EnumCtx ctx;
-    ctx.exe = ProcessImagePath(foreground);
+    ctx.exe = RealProcessImagePath(foreground);
     if (ctx.exe.empty())
         return false;
 
@@ -315,15 +381,15 @@ public:
     void RunSelfTest();
 
 private:
-    enum class St { Idle, Pending, Visible };
+    enum class St { Idle, Visible };
 
     static const UINT_PTR TIMER_ID = 1;
     static const UINT TIMER_MS = 25;
-    static const DWORD SHOW_DELAY_MS = 180; // hold longer than this to reveal the overlay
     static const int MAX_COLS = 6;
 
     static LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
+    void InstantCycle(bool forward);
     void OnTick();
     void Commit();
     void Cancel();
@@ -348,6 +414,7 @@ private:
     int Scaled(int v) const { return static_cast<int>(v * scale + 0.5); }
 
     HINSTANCE hinst = nullptr;
+    HBRUSH thumbHostBrush = nullptr; // AWC_MAGENTA debug brush (owned; freed in Shutdown)
     HWND backdropHost = nullptr; // optional translucent rounded background behind thumbnails
     HWND overlay = nullptr;     // layered chrome (cards/header/ring) with preview holes
     HWND thumbHost = nullptr;   // host BEHIND overlay; acrylic backdrop + DWM thumbnails
@@ -360,7 +427,13 @@ private:
     std::vector<HICON> icons;
     HWND anchorWindow = nullptr; // foreground window that invoked the current cycle
     int selected = 0;
-    DWORD startTick = 0;
+
+    // Instant (--no-overlay) cycling: the window list is snapshotted on the first
+    // press and reused across rapid presses, so cycling walks through every window
+    // instead of ping-ponging between the front two as the MRU Z-order reshuffles.
+    std::vector<HWND> instantList;
+    int instantIdx = -1;
+    DWORD instantTick = 0;
 
     // Layout (physical pixels, DPI-scaled at show time).
     double scale = 1.0;
@@ -390,9 +463,10 @@ bool Switcher::Init(HINSTANCE instance)
     hc.lpfnWndProc = &DefWindowProcW;
     hc.hInstance = hinst;
     hc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    hc.hbrBackground = GetEnvironmentVariableW(L"AWC_MAGENTA", nullptr, 0)
-                           ? CreateSolidBrush(AltTabStyle::DebugMagentaRef())
-                           : nullptr;
+    thumbHostBrush = GetEnvironmentVariableW(L"AWC_MAGENTA", nullptr, 0)
+                         ? CreateSolidBrush(AltTabStyle::DebugMagentaRef())
+                         : nullptr;
+    hc.hbrBackground = thumbHostBrush;
     hc.lpszClassName = L"AltWindowCycleThumbHost";
     RegisterClassW(&hc);
 
@@ -465,25 +539,71 @@ void Switcher::Shutdown()
         DestroyWindow(overlay);
         overlay = nullptr;
     }
+    if (thumbHostBrush)
+    {
+        DeleteObject(thumbHostBrush);
+        thumbHostBrush = nullptr;
+    }
+    UnregisterClassW(L"AltWindowCycleThumbHost", hinst);
+    UnregisterClassW(L"AltWindowCycleBackdropHost", hinst);
+    UnregisterClassW(L"AltWindowCycleOverlay", hinst);
 }
 
 // ---- state machine ----------------------------------------------------------
+
+// Instant (--no-overlay) switch. Activating a window pushes it to the front of the
+// system MRU Z-order, so re-enumerating on every press would only ever bounce
+// between the two front-most windows. Instead we snapshot the app's window list on
+// the first press and keep reusing it — advancing an index — for as long as the
+// presses keep coming and the foreground is still the window we just activated.
+void Switcher::InstantCycle(bool forward)
+{
+    static const DWORD kCycleTimeoutMs = 2000;
+
+    HWND fg = GetForegroundWindow();
+    DWORD now = GetTickCount();
+
+    bool continueCycle =
+        instantIdx >= 0 &&
+        instantIdx < static_cast<int>(instantList.size()) &&
+        (now - instantTick) < kCycleTimeoutMs &&
+        instantList[instantIdx] == fg;
+
+    if (!continueCycle)
+    {
+        HWND f2;
+        if (!GetAppWindows(f2, instantList) || instantList.size() < 2)
+        {
+            instantIdx = -1;
+            return;
+        }
+        instantIdx = 0;
+        for (size_t i = 0; i < instantList.size(); ++i)
+            if (instantList[i] == fg) { instantIdx = static_cast<int>(i); break; }
+    }
+
+    int n = static_cast<int>(instantList.size());
+    int target = Wrap(forward ? instantIdx + 1 : instantIdx - 1, n);
+
+    // Skip any windows that have closed since the snapshot was taken.
+    for (int tried = 0; tried < n && !IsWindow(instantList[target]); ++tried)
+        target = Wrap(forward ? target + 1 : target - 1, n);
+    if (!IsWindow(instantList[target]))
+    {
+        instantIdx = -1;
+        return;
+    }
+
+    instantIdx = target;
+    instantTick = now;
+    ForceForeground(instantList[target]);
+}
 
 void Switcher::OnHotkey(bool forward)
 {
     if (!showOverlay)
     {
-        // Original instant-switch behavior.
-        HWND fg;
-        std::vector<HWND> list;
-        if (!GetAppWindows(fg, list) || list.size() < 2)
-            return;
-        int idx = -1;
-        for (size_t i = 0; i < list.size(); ++i)
-            if (list[i] == fg) { idx = static_cast<int>(i); break; }
-        int n = static_cast<int>(list.size());
-        int target = (idx < 0) ? 0 : Wrap(forward ? idx + 1 : idx - 1, n);
-        ForceForeground(list[target]);
+        InstantCycle(forward);
         return;
     }
 
@@ -501,8 +621,8 @@ void Switcher::OnHotkey(bool forward)
 
         anchorWindow = fg;
         selected = Wrap(forward ? idx + 1 : idx - 1, static_cast<int>(windows.size()));
-        state = St::Pending;
-        startTick = GetTickCount();
+        ShowOverlayWindow();
+        state = St::Visible;
         SetTimer(overlay, TIMER_ID, TIMER_MS, nullptr);
     }
     else
@@ -527,11 +647,6 @@ void Switcher::OnTick()
     {
         Commit();
         return;
-    }
-    if (state == St::Pending && (GetTickCount() - startTick) >= SHOW_DELAY_MS)
-    {
-        ShowOverlayWindow();
-        state = St::Visible;
     }
 }
 
@@ -631,8 +746,8 @@ void Switcher::ShowOverlayWindow()
     bool translucentBackdrop = GetEnvironmentVariableW(L"AWC_TRANSLUCENT_BACKDROP", nullptr, 0) != 0;
     bool noThumbnails = GetEnvironmentVariableW(L"AWC_NO_THUMBNAILS", nullptr, 0) != 0;
     bool whitePreview = GetEnvironmentVariableW(L"AWC_WHITE_PREVIEW", nullptr, 0) != 0;
-    bool forceDwmThumbnails = GetEnvironmentVariableW(L"AWC_DWM_THUMBNAILS", nullptr, 0) != 0;
-    snapshotThumbnails = !forceDwmThumbnails && !noThumbnails && !whitePreview;
+    bool forceSnapshotThumbnails = GetEnvironmentVariableW(L"AWC_SNAPSHOT_THUMBNAILS", nullptr, 0) != 0;
+    snapshotThumbnails = forceSnapshotThumbnails && !noThumbnails && !whitePreview;
 
     if (snapshotThumbnails)
         CaptureSnapshots();
@@ -651,8 +766,6 @@ void Switcher::ShowOverlayWindow()
     // DWM thumbnail layer remains fully opaque above it.
     if (translucentBackdrop)
     {
-        SetWindowPos(backdropHost, HWND_TOPMOST, x, y, panelW, panelH,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
         RenderBackdrop();
     }
     else
@@ -664,7 +777,7 @@ void Switcher::ShowOverlayWindow()
     if (showThumbHost)
     {
         SetWindowPos(thumbHost, HWND_TOPMOST, x, y, panelW, panelH,
-                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
         if (!magentaDebug && !translucentBackdrop)
             EnableAcrylic(thumbHost, GetAcrylicGradientABGR());
         DWORD cornerPref = DWMWCP_ROUND;
@@ -709,9 +822,16 @@ void Switcher::ShowOverlayWindow()
     }
     RegisterThumbnails();
 
+    // Update the hidden layered bitmap before showing it. Otherwise monitor/DPI
+    // switches can flash the previous-size overlay for one frame.
+    RenderLayered();
+    if (showThumbHost)
+    {
+        SetWindowPos(thumbHost, HWND_TOPMOST, x, y, panelW, panelH,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
     SetWindowPos(overlay, HWND_TOPMOST, x, y, panelW, panelH,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RenderLayered();
     if (showThumbHost)
     {
         // Keep the host directly behind the overlay in the topmost band.
@@ -721,7 +841,7 @@ void Switcher::ShowOverlayWindow()
     if (translucentBackdrop)
     {
         SetWindowPos(backdropHost, showThumbHost ? thumbHost : overlay, 0, 0, 0, 0,
-                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE);
+                     SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
     }
 }
 
@@ -748,14 +868,14 @@ void Switcher::ComputeLayout(const RECT& work, int& x, int& y, int& panelW, int&
     gap = Scaled(26);
     tileW = Scaled(300);
     headerH = Scaled(44);
-    previewH = Scaled(176);
-    // Win11 Alt-Tab thumbnails align with the card/header edges. The rounded bottom
-    // corners are produced by the layered overlay mask, not by insetting the image.
-    inner = 0;
+    previewH = Scaled(158);
+    // Public DWM thumbnails are rectangular and cannot be alpha-clipped, so the
+    // live preview is an intentional inset viewport inside rounded card chrome.
+    inner = Scaled(8);
     radius = Scaled(8);
-    cardTrimBottom = radius;
+    cardTrimBottom = 0;
     iconSize = Scaled(24);
-    tileH = headerH + previewH;
+    tileH = headerH + inner + previewH + inner;
 
     int workW = work.right - work.left;
     int workH = work.bottom - work.top;
@@ -783,12 +903,14 @@ RECT Switcher::TileRect(int index) const
     return r;
 }
 
-// The live thumbnail sits below the header "tab" edge-to-edge with the card.
-// DWM thumbnails render as rectangles even when the host has a rounded region, so
-// the overlay paints bottom-corner covers to make the live preview read as rounded.
+// The live DWM thumbnail is a rectangular viewport, inset from the rounded card
+// corners because public DWM thumbnails cannot be clipped by layered-window alpha.
 RECT Switcher::PreviewRect(const RECT& tile) const
 {
-    RECT r = { tile.left + inner, tile.top + headerH, tile.right - inner, tile.bottom - inner };
+    RECT r = { tile.left + inner,
+               tile.top + headerH + inner,
+               tile.right - inner,
+               tile.bottom - inner };
     return r;
 }
 
@@ -925,38 +1047,6 @@ static SnapshotThumb CaptureWindowClientSnapshot(HWND hwnd)
     return snap;
 }
 
-static void ClearPreviewBottomCorners(Gdiplus::Graphics& g, const RECT& pv, int radius)
-{
-    Gdiplus::REAL r = static_cast<Gdiplus::REAL>(radius);
-    if (r <= 0)
-        return;
-
-    Gdiplus::REAL L = static_cast<Gdiplus::REAL>(pv.left);
-    Gdiplus::REAL R = static_cast<Gdiplus::REAL>(pv.right);
-    Gdiplus::REAL B = static_cast<Gdiplus::REAL>(pv.bottom);
-    Gdiplus::SolidBrush clearBrush(AltTabStyle::Transparent());
-
-    Gdiplus::GraphicsState state = g.Save();
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-
-    Gdiplus::GraphicsPath bottomL;
-    bottomL.AddLine(L, B - r, L, B);
-    bottomL.AddLine(L, B, L + r, B);
-    bottomL.AddArc(L, B - 2 * r, 2 * r, 2 * r, 90, 90);
-    bottomL.CloseFigure();
-    g.FillPath(&clearBrush, &bottomL);
-
-    Gdiplus::GraphicsPath bottomR;
-    bottomR.AddLine(R, B - r, R, B);
-    bottomR.AddLine(R, B, R - r, B);
-    bottomR.AddArc(R - 2 * r, B - 2 * r, 2 * r, 2 * r, 90, -90);
-    bottomR.CloseFigure();
-    g.FillPath(&clearBrush, &bottomR);
-
-    g.Restore(state);
-}
-
 void Switcher::ClearSnapshots()
 {
     for (SnapshotThumb& snap : snapshots)
@@ -989,14 +1079,9 @@ void Switcher::RegisterThumbnails()
         GetEnvironmentVariableW(L"AWC_WHITE_PREVIEW", nullptr, 0))
         return;
 
-    // Keep the thumbnail edge-to-edge with the card. Only the top is overscanned so
-    // its soft DWM edge tucks under the opaque header tab; side/bottom overscan would
-    // leak into the gaps because public DWM thumbnails ignore window regions.
-    const int topOver = (std::max)(3, Scaled(3));
     for (size_t i = 0; i < windows.size(); ++i)
     {
         RECT dest = PreviewRect(TileRect(static_cast<int>(i)));
-        dest.top -= topOver;
         HTHUMBNAIL th = nullptr;
         if (FAILED(DwmRegisterThumbnail(thumbHost, windows[i], &th)) || !th)
         {
@@ -1061,29 +1146,87 @@ void Switcher::EnsureFont()
         font = nullptr;
     }
     int height = -Scaled(15);
-    BYTE quality = scale > 1.01 ? ANTIALIASED_QUALITY : CLEARTYPE_NATURAL_QUALITY;
     font = CreateFontW(height, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
-                       quality, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+                       CLEARTYPE_NATURAL_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
     fontScale = scale;
 }
 
-static void DrawHeaderText(HDC dc, HFONT font, const RECT& rc, const std::wstring& text, COLORREF color)
+static void DrawHeaderText(BYTE* destBits, int destW, int destH, HFONT font,
+                           const RECT& rc, const std::wstring& text,
+                           COLORREF textColor, COLORREF backgroundColor)
 {
-    if (text.empty() || !font)
+    if (!destBits || destW <= 0 || destH <= 0 || text.empty() || !font)
         return;
 
-    HGDIOBJ oldFont = SelectObject(dc, font);
-    int oldBk = SetBkMode(dc, TRANSPARENT);
-    COLORREF oldColor = SetTextColor(dc, color);
+    int w = rc.right - rc.left;
+    int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0)
+        return;
 
-    RECT textRc = rc;
-    DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &textRc,
+    HDC screen = GetDC(nullptr);
+    HDC textDC = CreateCompatibleDC(screen);
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* scratchBits = nullptr;
+    HBITMAP scratch = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &scratchBits, nullptr, 0);
+    if (!scratch)
+    {
+        DeleteDC(textDC);
+        ReleaseDC(nullptr, screen);
+        return;
+    }
+
+    HGDIOBJ oldBmp = SelectObject(textDC, scratch);
+    HGDIOBJ oldFont = SelectObject(textDC, font);
+    RECT fill = { 0, 0, w, h };
+    HBRUSH bg = CreateSolidBrush(backgroundColor);
+    FillRect(textDC, &fill, bg);
+    DeleteObject(bg);
+
+    int oldBk = SetBkMode(textDC, TRANSPARENT);
+    COLORREF oldColor = SetTextColor(textDC, textColor);
+
+    RECT textRc = fill;
+    DrawTextW(textDC, text.c_str(), static_cast<int>(text.size()), &textRc,
               DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 
-    SetTextColor(dc, oldColor);
-    SetBkMode(dc, oldBk);
-    SelectObject(dc, oldFont);
+    SetTextColor(textDC, oldColor);
+    SetBkMode(textDC, oldBk);
+    SelectObject(textDC, oldFont);
+
+    const BYTE* src = static_cast<const BYTE*>(scratchBits);
+    for (int y = 0; y < h; ++y)
+    {
+        int dy = rc.top + y;
+        if (dy < 0 || dy >= destH)
+            continue;
+        for (int x = 0; x < w; ++x)
+        {
+            int dx = rc.left + x;
+            if (dx < 0 || dx >= destW)
+                continue;
+
+            const BYTE* s = src + (static_cast<size_t>(y) * w + x) * 4;
+            BYTE* d = destBits + (static_cast<size_t>(dy) * destW + dx) * 4;
+            d[0] = s[0];
+            d[1] = s[1];
+            d[2] = s[2];
+            d[3] = 255;
+        }
+    }
+
+    SelectObject(textDC, oldBmp);
+    DeleteObject(scratch);
+    DeleteDC(textDC);
+    ReleaseDC(nullptr, screen);
 }
 
 static std::wstring GetTitle(HWND hwnd)
@@ -1152,26 +1295,6 @@ static void BuildRoundRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& r,
     path.CloseFigure();
 }
 
-static void BuildTopRoundRect(Gdiplus::GraphicsPath& path, const Gdiplus::RectF& r, Gdiplus::REAL rad)
-{
-    path.Reset();
-    Gdiplus::REAL d = rad * 2;
-    if (d <= 0 || d > r.Width || d > r.Height)
-    {
-        path.AddRectangle(r);
-        return;
-    }
-
-    path.StartFigure();
-    path.AddLine(r.X, r.GetBottom(), r.X, r.Y + rad);
-    path.AddArc(r.X, r.Y, d, d, 180, 90);
-    path.AddLine(r.X + rad, r.Y, r.GetRight() - rad, r.Y);
-    path.AddArc(r.GetRight() - d, r.Y, d, d, 270, 90);
-    path.AddLine(r.GetRight(), r.Y + rad, r.GetRight(), r.GetBottom());
-    path.AddLine(r.GetRight(), r.GetBottom(), r.X, r.GetBottom());
-    path.CloseFigure();
-}
-
 static Gdiplus::RectF InflateF(const RECT& r, int by)
 {
     return Gdiplus::RectF(
@@ -1233,6 +1356,25 @@ static void DrawIconOverPARGB(void* destBits, int destW, int destH,
         }
     }
 
+    // Legacy (1-bit mask) icons carry no per-pixel alpha, so DrawIconEx leaves the
+    // alpha channel at 0 and a pure-black opaque pixel is indistinguishable from a
+    // transparent one by color alone. Render the icon a second time over a white
+    // background: pixels identical on both backgrounds are opaque (preserving black
+    // detail), pixels that differ by ~full white are transparent.
+    void* whiteBits = nullptr;
+    HBITMAP whiteDib = nullptr;
+    if (!hasAlpha)
+    {
+        whiteDib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &whiteBits, nullptr, 0);
+        if (whiteDib)
+        {
+            SelectObject(iconDC, whiteDib);
+            memset(whiteBits, 0xFF, static_cast<size_t>(size) * size * 4);
+            DrawIconEx(iconDC, 0, 0, icon, size, size, 0, nullptr, DI_NORMAL);
+        }
+    }
+    BYTE* white = reinterpret_cast<BYTE*>(whiteBits);
+
     for (int sy = 0; sy < size; ++sy)
     {
         int dy = y + sy;
@@ -1244,7 +1386,8 @@ static void DrawIconOverPARGB(void* destBits, int destW, int destH,
             if (dx < 0 || dx >= destW)
                 continue;
 
-            BYTE* s = src + (static_cast<size_t>(sy) * size + sx) * 4;
+            size_t srcOff = (static_cast<size_t>(sy) * size + sx) * 4;
+            BYTE* s = src + srcOff;
             BYTE* d = dst + (static_cast<size_t>(dy) * destW + dx) * 4;
 
             if (hasAlpha)
@@ -1269,18 +1412,34 @@ static void DrawIconOverPARGB(void* destBits, int destW, int destH,
                 d[2] = static_cast<BYTE>((std::min)(255, sr + (d[2] * inv + 127) / 255));
                 d[3] = 255;
             }
-            else if (s[0] || s[1] || s[2])
+            else
             {
-                d[0] = s[0];
-                d[1] = s[1];
-                d[2] = s[2];
-                d[3] = 255;
+                bool opaque;
+                if (white)
+                {
+                    BYTE* w = white + srcOff;
+                    int diff = (w[0] - s[0]) + (w[1] - s[1]) + (w[2] - s[2]);
+                    opaque = diff < 384; // < half of 3*255 → covered on both backgrounds
+                }
+                else
+                {
+                    opaque = (s[0] || s[1] || s[2]);
+                }
+                if (opaque)
+                {
+                    d[0] = s[0];
+                    d[1] = s[1];
+                    d[2] = s[2];
+                    d[3] = 255;
+                }
             }
         }
     }
 
     SelectObject(iconDC, oldBmp);
     DeleteObject(dib);
+    if (whiteDib)
+        DeleteObject(whiteDib);
     DeleteDC(iconDC);
     ReleaseDC(nullptr, screen);
 }
@@ -1344,11 +1503,10 @@ void Switcher::RenderBackdrop()
     ReleaseDC(nullptr, screenDC);
 }
 
-// Renders the overlay chrome and default same-surface preview snapshots into a
-// 32-bpp premultiplied top-down DIB, then pushes it via UpdateLayeredWindow. Keeping
-// thumbnails in this DIB lets the bottom corners be a real transparent alpha mask
-// over the acrylic backdrop. The legacy DWM-thumbnail path is still available via
-// AWC_DWM_THUMBNAILS for comparison, but it needs opaque corner covers.
+// Renders the overlay chrome and optional same-surface preview snapshots into a
+// 32-bpp premultiplied top-down DIB, then pushes it via UpdateLayeredWindow. The
+// default path uses DWM live thumbnails behind this layered chrome for fidelity and
+// responsiveness; AWC_SNAPSHOT_THUMBNAILS remains as a diagnostic comparison mode.
 void Switcher::RenderLayered()
 {
     int w = ovW;
@@ -1385,8 +1543,6 @@ void Switcher::RenderLayered()
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
         // Grayscale AA (not ClearType) avoids colored fringing over transparency.
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
-        bool magentaDebug = GetEnvironmentVariableW(L"AWC_MAGENTA", nullptr, 0) != 0;
-        bool translucentBackdrop = GetEnvironmentVariableW(L"AWC_TRANSLUCENT_BACKDROP", nullptr, 0) != 0;
         bool noThumbnails = GetEnvironmentVariableW(L"AWC_NO_THUMBNAILS", nullptr, 0) != 0;
         bool whitePreview = GetEnvironmentVariableW(L"AWC_WHITE_PREVIEW", nullptr, 0) != 0;
 
@@ -1413,22 +1569,17 @@ void Switcher::RenderLayered()
             bool sel = (i == selected);
             RECT pv = PreviewRect(tile);
 
-            // Opaque top tab only. Do not draw a full-height card behind the preview:
-            // that was the stray opaque element still visible at the thumbnail bottom.
-            RECT tab = { tile.left, tile.top, tile.right, pv.top };
-            Gdiplus::GraphicsPath tabPath;
-            BuildTopRoundRect(tabPath, InflateF(tab, 0), static_cast<Gdiplus::REAL>(radius));
-            Gdiplus::SolidBrush tabBrush(AltTabStyle::Card(sel));
-            g.FillPath(&tabBrush, &tabPath);
+            // Full rounded card chrome. The live DWM preview is a rectangular
+            // viewport inside it, which avoids fighting public DWM's square thumbnail.
+            Gdiplus::GraphicsPath cardPath;
+            BuildRoundRect(cardPath, InflateF(tile, 0), static_cast<Gdiplus::REAL>(radius));
+            Gdiplus::SolidBrush cardBrush(AltTabStyle::Card(sel));
+            g.FillPath(&cardBrush, &cardPath);
 
-            // Same-surface previews can be alpha-masked for real. Public DWM live
-            // thumbnails are a separate HWND composition layer, so that path still
-            // needs opaque corner covers.
             int pw = pv.right - pv.left;
             int ph = pv.bottom - pv.top;
             if (!noThumbnails && pw > 0 && ph > 0)
             {
-                Gdiplus::REAL r = static_cast<Gdiplus::REAL>(radius + Scaled(4));
                 if (whitePreview)
                 {
                     g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
@@ -1439,7 +1590,6 @@ void Switcher::RenderLayered()
                                     static_cast<Gdiplus::REAL>(pv.top),
                                     static_cast<Gdiplus::REAL>(pw),
                                     static_cast<Gdiplus::REAL>(ph));
-                    ClearPreviewBottomCorners(g, pv, static_cast<int>(r));
                     g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
                 }
                 else if (snapshotThumbnails)
@@ -1468,7 +1618,6 @@ void Switcher::RenderLayered()
                                     src.left, src.top, src.right - src.left, src.bottom - src.top,
                                     Gdiplus::UnitPixel);
                         g.Restore(saved);
-                        ClearPreviewBottomCorners(g, pv, static_cast<int>(r));
                     }
                 }
                 else
@@ -1482,33 +1631,12 @@ void Switcher::RenderLayered()
                                     static_cast<Gdiplus::REAL>(pw),
                                     static_cast<Gdiplus::REAL>(ph));
                     g.SetCompositingMode(Gdiplus::CompositingModeSourceOver);
-
-                    Gdiplus::REAL cover = static_cast<Gdiplus::REAL>((std::max)(1, Scaled(1)));
-                    Gdiplus::REAL L = static_cast<Gdiplus::REAL>(pv.left);
-                    Gdiplus::REAL R = static_cast<Gdiplus::REAL>(pv.right);
-                    Gdiplus::REAL B = static_cast<Gdiplus::REAL>(pv.bottom);
-                    Gdiplus::REAL Lc = L - cover;
-                    Gdiplus::REAL Rc = R + cover;
-                    Gdiplus::REAL Bc = B + cover;
-                    Gdiplus::SolidBrush maskBrush(
-                        AltTabStyle::PreviewMask(sel, magentaDebug, translucentBackdrop));
-                    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-
-                    Gdiplus::GraphicsPath bottomL;
-                    bottomL.AddLine(Lc, Bc - r, Lc, Bc);
-                    bottomL.AddLine(Lc, Bc, Lc + r, Bc);
-                    bottomL.AddArc(Lc, Bc - 2 * r, 2 * r, 2 * r, 90, 90);
-                    bottomL.CloseFigure();
-                    g.FillPath(&maskBrush, &bottomL);
-
-                    Gdiplus::GraphicsPath bottomR;
-                    bottomR.AddLine(Rc, Bc - r, Rc, Bc);
-                    bottomR.AddLine(Rc, Bc, Rc - r, Bc);
-                    bottomR.AddArc(Rc - 2 * r, Bc - 2 * r, 2 * r, 2 * r, 90, -90);
-                    bottomR.CloseFigure();
-                    g.FillPath(&maskBrush, &bottomR);
                 }
-
+                Gdiplus::Pen previewPen(AltTabStyle::PreviewStroke(sel),
+                                         static_cast<Gdiplus::REAL>((std::max)(1, Scaled(1))));
+                g.SetSmoothingMode(Gdiplus::SmoothingModeNone);
+                g.DrawRectangle(&previewPen, pv.left, pv.top, pw - 1, ph - 1);
+                g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
             }
 
             // Header "tab": app icon + window title.
@@ -1526,7 +1654,8 @@ void Switcher::RenderLayered()
             std::wstring text = GetTitle(windows[i]);
             g.Flush();
             RECT textRc = { textLeft, tile.top, hdr.right, tile.top + headerH };
-            DrawHeaderText(memDC, font, textRc, text, AltTabStyle::HeaderTextRef(sel));
+            DrawHeaderText(static_cast<BYTE*>(bits), w, h, font, textRc, text,
+                           AltTabStyle::HeaderTextRef(sel), AltTabStyle::CardRef(sel));
 
             // Two-ring focus with a clear padding gap to the tile.
             if (sel)
